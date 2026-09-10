@@ -11,7 +11,15 @@ foundation for two features that aren't implemented yet:
    supply a phone before continuing, closing the gap where `accountRegister`
    itself has no phone field and can't atomically enforce one (see
    `proton_storefront`'s registration-flow diagnostic for why).
-2. **Future OTP-login** — see "Future OTP integration point" below.
+2. **OTP-based passwordless login** — `POST /otp/send` + `POST /otp/verify`
+   (below) issue and check one-time codes against the phone table. Saleor's
+   plugin system was confirmed (separate research session) to provide **zero**
+   built-in protection for an external-auth flow like this — no rate limiting,
+   no replay protection — so every safeguard here is this service's own. A
+   Saleor plugin calling `POST /otp/verify` to mint a real session token is a
+   **separate, not-yet-built** piece — this service only proves phone
+   ownership and reports the linked `userId` (or `null`); it has no concept of
+   a Saleor session itself.
 
 ## Design constraints
 
@@ -21,9 +29,9 @@ This service is **fully independent** of `proton_storefront` and
 - It does **not** modify the Saleor image, Dockerfile, `settings.py`, or
   `urls.py`.
 - It has zero coupling to Saleor's codebase or deployment lifecycle.
-- It owns exactly one, uniquely named Postgres table, `user_phones`, in the
-  same `saleor` database. The name was checked against existing tables — no
-  collision.
+- It owns two uniquely named Postgres tables, `user_phones` and `otp_codes`,
+  in the same `saleor` database. Both names were checked against existing
+  tables — no collision.
 - Unlike `proton_analytics` and `proton_payments`, this service handles PII
   (phone numbers) and is **not** left open on the internal network — every
   route except `/health` requires a bearer service token (see "Auth" below).
@@ -78,6 +86,30 @@ Docker healthcheck without also provisioning the token there.
 This service is still internal-network only — `SERVICE_TOKEN` prevents
 *other containers* on the shared network from reading/writing phone data
 casually, it does not make the service safe to expose publicly.
+
+## SMS delivery — not wired yet
+
+`src/smsSender.ts` exports one function:
+
+```ts
+export async function send(phone: string, message: string): Promise<void>
+```
+
+Its only implementation right now is a **dev-only stub** that logs the
+message instead of sending it — no SMS provider account exists yet. It never
+throws, so the full `POST /otp/send` success path is testable locally without
+any real SMS. Every code sent locally is readable in the server's stdout:
+
+```
+[DEV SMS] Would send to +971501234567: Your Tawasi Plus verification code is 123456. It expires in 5 minutes.
+```
+
+**Wiring a real provider (e.g. Twilio) is a single-file change**: replace the
+body of `send()` with a real API call. It should resolve on confirmed
+delivery and reject/throw on failure — `POST /otp/send`'s handler already
+catches a throw from `send()` and responds `503`, so no caller-side change is
+needed. Do not change the function's signature without updating both call
+sites (`POST /otp/send` and any future caller).
 
 ## Running locally
 
@@ -177,6 +209,66 @@ so callers may pass a raw local-format number, not just E.164.
 401:      { "error": "unauthorized" }
 ```
 
+### `POST /otp/send`
+
+Generates and "sends" (see "SMS delivery" above) a 6-digit code for a phone
+number. Not tied to `user_phones` at all — a phone can request a code before
+any account exists for it (see `POST /otp/verify`'s `userId: null` case).
+
+```
+Request:  { "phone": "0501234567" }
+200:      { "sent": true, "expiresInSeconds": 300 }
+400:      { "error": "phone is not a valid phone number" }
+429:      { "error": "resend_too_soon" }   // a non-expired, non-consumed code was issued < 60s ago
+429:      { "error": "rate_limited" }      // 5+ codes already requested for this phone in the last hour
+503:      { "error": "could not send code" }
+401:      { "error": "unauthorized" }
+```
+
+Rate limits, and why:
+- **60s resend cooldown** — the ordinary "didn't get it, resend" case is
+  still fast, but a tight retry loop can't multiply SMS spend or hammer the
+  provider.
+- **5 sends/hour per phone** — independent of the cooldown (a caller who
+  patiently waits out each 60s cooldown could otherwise resend indefinitely);
+  this is the actual ceiling on SMS cost from abuse against one number.
+- Both are enforced against `phone_e164` only, not IP — this service sits
+  behind `SERVICE_TOKEN`, so the caller is always the same trusted internal
+  service (the storefront route, later a Saleor plugin), not the end user's
+  browser directly; per-phone limits are what actually matters here.
+
+### `POST /otp/verify`
+
+Checks a code against the most recently issued, still-unconsumed code for
+that phone. Codes are **single-use** — a successful verify immediately marks
+the row `consumed`, so replaying the same correct code again always reports
+`expired_or_not_found`, never a second success.
+
+```
+Request:  { "phone": "0501234567", "code": "123456" }
+200:      { "verified": true, "userId": "VXNlcjox" }   // phone is linked to an account
+200:      { "verified": true, "userId": null }         // ownership verified, no account linked yet
+400:      { "error": "phone is not a valid phone number" }
+400:      { "error": "code must be a non-empty string" }
+400:      { "error": "expired_or_not_found" }
+400:      { "error": "invalid_code", "attemptsRemaining": 4 }
+429:      { "error": "too_many_attempts" }   // 5 wrong guesses already made against this code — refused outright, even with the correct code
+503:      { "error": "verification unavailable" }
+401:      { "error": "unauthorized" }
+```
+
+`userId: null` is a **valid, successful outcome**, not an error — this
+service's job is only to report the facts (ownership verified; account
+linked or not) accurately. What "verified but no account" *means* is a
+decision for the caller (a future Saleor plugin implementing
+`external_obtain_access_tokens` — see the passwordless-login research
+session for why that's the sanctioned mechanism and what it requires).
+
+5-attempt lockout is checked, and enforced, **before** the hash comparison —
+a code that has already hit the cap is refused outright on every subsequent
+call, correct guess or not, rather than silently counting attempts past the
+limit.
+
 ### `GET /health`
 
 Actively checks Postgres (`SELECT 1`) and is the **only** unauthenticated
@@ -195,13 +287,33 @@ CREATE TABLE IF NOT EXISTS user_phones (
     phone_e164  TEXT NOT NULL UNIQUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS otp_codes (
+    id          SERIAL PRIMARY KEY,
+    phone_e164  TEXT NOT NULL,
+    code_hash   TEXT NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    consumed    BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS otp_codes_phone_e164_idx ON otp_codes (phone_e164);
 ```
 
 Created idempotently at startup. No ORM and no migration framework — a
 single raw statement is sufficient at this scope, same as
-`proton_analytics`. The `UNIQUE` constraint on `phone_e164` is load-bearing:
-it enforces "one phone per account, one account per phone" at the database
-level, and `POST /phones`'s `409` response depends on it firing.
+`proton_analytics`. The `UNIQUE` constraint on `user_phones.phone_e164` is
+load-bearing: it enforces "one phone per account, one account per phone" at
+the database level, and `POST /phones`'s `409` response depends on it
+firing. `otp_codes` has no such constraint and no foreign key to
+`user_phones` — a phone can have several outstanding rows (rate limits above
+bound how many) and can be verifying ownership before any `user_phones` row
+exists for it at all.
+
+`code_hash` stores a plain SHA-256 hex digest — never the raw code, even
+though codes are short-lived, in case the database is ever exposed. Codes are
+compared via the same constant-time helper (`constantTimeEqual`, `auth.ts`)
+already used for the `SERVICE_TOKEN` check.
 
 ## Known dependency advisories
 

@@ -32,6 +32,26 @@ export async function ensureSchema(): Promise<void> {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
 	`);
+
+	// code_hash, never the raw code — codes are short-lived, but there's no reason to
+	// keep them recoverable at rest in case the DB is ever exposed. No UNIQUE/FK to
+	// user_phones: a phone can be verifying ownership before any account exists for
+	// it yet (see POST /otp/verify's userId:null case), and multiple outstanding
+	// codes for the same phone are allowed (rate limits in otp.ts bound how many).
+	await pool.query(`
+		CREATE TABLE IF NOT EXISTS otp_codes (
+			id SERIAL PRIMARY KEY,
+			phone_e164 TEXT NOT NULL,
+			code_hash TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			consumed BOOLEAN NOT NULL DEFAULT false,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`);
+	await pool.query(`
+		CREATE INDEX IF NOT EXISTS otp_codes_phone_e164_idx ON otp_codes (phone_e164)
+	`);
 }
 
 export async function closeDb(): Promise<void> {
