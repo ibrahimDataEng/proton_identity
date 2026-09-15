@@ -193,6 +193,28 @@ etc.).
 `userId` is a Saleor global ID (base64-encoded) and may contain `+`, `/`, or
 `=`. Callers **must** `encodeURIComponent()` it before building the path.
 
+### `GET /phones/:userId`
+
+**Deliberate, narrow exception to the PII-minimization principle above** —
+returns the actual stored number, for a signed-in user viewing/editing their
+own number in account settings. Unlike `/phones/status`, this must **never**
+be called with anything but a userId the caller has independently verified
+belongs to the requester's own authenticated session — this endpoint has no
+way to enforce that itself (same trust boundary as every other route here:
+the service-token header authenticates the *caller service*, not the end
+user). No fail-open value exists for this endpoint on failure — a wrong or
+fabricated number is a correctness bug, not a safe default — so callers must
+treat a non-200 as "couldn't load," not as "no phone."
+
+```
+200:      { "phone": "+971501234567" }
+200:      { "phone": null }
+503:      { "error": "phone unavailable" }
+401:      { "error": "unauthorized" }
+```
+
+Same userId encoding rule as `/phones/status/:userId` above.
+
 ### `GET /phones/lookup?phone=<value>`
 
 **Future OTP integration point.** Not called by anything yet — this is the

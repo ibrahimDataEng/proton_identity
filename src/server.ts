@@ -72,6 +72,28 @@ app.get("/phones/status/:userId", async (req: Request, res: Response) => {
 	}
 });
 
+// Deliberate, narrow exception to /phones/status's PII-minimization design: that
+// endpoint exists for an unattended login-gate check and must never leak the number
+// itself. This endpoint is for a signed-in user viewing/editing their OWN number in
+// account settings — the caller (front_store's identity.ts) is expected to resolve
+// userId from the requester's own session before ever reaching this route, the same
+// discipline already required of every other caller of this service. On any failure,
+// respond 503 rather than guessing — unlike /phones/status, there is no safe fail-open
+// value here (fabricating or omitting a number is a correctness bug, not a convenience).
+app.get("/phones/:userId", async (req: Request, res: Response) => {
+	const { userId } = req.params;
+	try {
+		const { rows } = await pool.query<{ phone_e164: string }>(
+			"SELECT phone_e164 FROM user_phones WHERE user_id = $1",
+			[userId],
+		);
+		return res.json({ phone: rows[0]?.phone_e164 ?? null });
+	} catch (error) {
+		console.error(`[phones/:userId] query failed: ${describeError(error)}`);
+		return res.status(503).json({ error: "phone unavailable" });
+	}
+});
+
 app.get("/phones/lookup", async (req: Request, res: Response) => {
 	const normalized = normalizePhone(req.query.phone);
 	if (!normalized.ok) {
